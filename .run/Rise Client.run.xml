@@ -1,0 +1,14 @@
+<component name="ProjectRunConfigurationManager">
+  <!-- gameassets + gamedir fill run/ before launch -->
+  <configuration default="false" name="Rise Client" type="Application" factoryName="Application" nameIsGenerated="false">
+    <option name="MAIN_CLASS_NAME" value="Start" />
+    <module name="rise-open-source-ideaready.main" />
+    <option name="VM_PARAMETERS" value="-Drise.gameDir=$PROJECT_DIR$/run -Djava.library.path=$PROJECT_DIR$/run/natives" />
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$/run" />
+    <method v="2">
+      <option name="Gradle.BeforeRunTask" enabled="true" tasks="gameAssets" externalProjectPath="$PROJECT_DIR$" vmOptions="" scriptParameters="" />
+      <option name="Gradle.BeforeRunTask" enabled="true" tasks="gameDir" externalProjectPath="$PROJECT_DIR$" vmOptions="" scriptParameters="" />
+      <option name="Make" enabled="true" />
+    </method>
+  </configuration>
+</component>

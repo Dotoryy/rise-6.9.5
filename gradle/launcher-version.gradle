@@ -1,0 +1,48 @@
+// builds a versions/Rise folder any launcher can run
+
+def launcherOut = layout.buildDirectory.dir('launcher/Rise')
+
+def launcherJar = tasks.register('launcherJar', Jar) {
+    group = 'distribution'
+    description = 'Client and its dependencies in one jar, for a versions/<id> folder.'
+    dependsOn 'clientJar'
+    archiveFileName = 'Rise.jar'
+    destinationDirectory = launcherOut
+    // client first: its log4j stub must win, as Rise's own classpath order does
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from zipTree(tasks.named('clientJar').flatMap { it.archiveFile })
+    from zipTree('libs/libraries.jar')
+}
+
+def launcherJson = tasks.register('launcherJson') {
+    group = 'distribution'
+    description = 'Version manifest for the launcher jar, derived from official 1.8.9 metadata.'
+    dependsOn 'downloadVersionMetadata'
+    def src = tasks.named('downloadVersionMetadata').flatMap { it.destination }
+    def out = launcherOut.map { it.file('Rise.json') }
+    inputs.file(src)
+    outputs.file(out)
+    doLast {
+        def d = new groovy.json.JsonSlurper().parse(src.get().asFile, 'UTF-8')
+        d.id = 'Rise'
+        // Rise is a jar mod: Minecraft.class boots the client, and Start would duplicate launcher argv
+        d.mainClass = 'net.minecraft.client.main.Main'
+        // the merged jar carries log4j; the real one must not load ahead of Rise's stub
+        d.libraries = d.libraries.findAll { !it.name.contains('log4j') }
+        // "jar" would redirect the launcher to vanilla's jar and silently run vanilla
+        ['jar', 'downloads', 'patches', 'root', 'logging'].each { d.remove(it) }
+        def f = out.get().asFile
+        f.parentFile.mkdirs()
+        f.text = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(d))
+    }
+}
+
+tasks.register('launcherVersion') {
+    group = 'distribution'
+    description = 'Rise.jar + Rise.json, ready to drop into <game dir>/versions/Rise.'
+    dependsOn launcherJar, launcherJson
+    doLast {
+        logger.lifecycle("versions/Rise ready: ${launcherOut.get().asFile}")
+        logger.lifecycle('copy that folder into <game dir>/versions/ and pick Rise in the launcher')
+    }
+}

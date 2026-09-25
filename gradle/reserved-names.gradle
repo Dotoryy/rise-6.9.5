@@ -1,0 +1,625 @@
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+
+// the client reads these names back at runtime, so renaming into them is not safe
+
+def reservedNames = tasks.register('reservedNames', ReservedNamesCheck) {
+    group = 'verification'
+    description = 'Fail the build on class, member and thread names the client reacts to at runtime.'
+    sources.from(fileTree('src/main/java') { include '**/*.java' })
+    report = layout.buildDirectory.file('reports/reserved-names.txt')
+}
+
+plugins.withId('java') {
+    tasks.named('check') { dependsOn reservedNames }
+}
+
+@groovy.transform.CompileStatic
+class ScannedFile {
+    String path
+    String pkg = ''
+    String code = ''
+    String text = ''
+    String primary = null
+    List<String> types = new ArrayList<String>()
+    List<Integer> typeAt = new ArrayList<Integer>()
+}
+
+@groovy.transform.CompileStatic
+abstract class ReservedNamesCheck extends DefaultTask {
+
+    private static final String DQ = '"(?:\\\\.|[^"\\\\])*"'
+    private static final String SQ = "'(?:\\\\.|[^'\\\\])*'"
+
+    private static final Pattern TOKEN = Pattern.compile(DQ + '|' + SQ + '|//[^\\n]*|/\\*(?s:.)*?\\*/')
+    private static final Pattern STRING = Pattern.compile(DQ)
+    private static final Pattern PACKAGE = Pattern.compile('(?<![\\w$.])package\\s+([\\w$.]+)\\s*;')
+    private static final Pattern TYPE = Pattern.compile(
+            '(?<![\\w$.@])(?:class|interface|enum|record|@interface)\\s+([A-Za-z_$][\\w$]*)')
+    private static final Pattern CHAR_ARRAY = Pattern.compile(
+            'new\\s+String\\s*\\(\\s*(?:\\(\\s*char\\s*\\[\\s*\\]\\s*\\)\\s*)?new\\s+char\\s*\\[\\s*\\]\\s*\\{([^}]*)\\}\\s*\\)')
+    private static final Pattern CHAR_LIT = Pattern.compile("'(\\\\.|[^'\\\\])'")
+    private static final Pattern FQN = Pattern.compile('(?:[a-zA-Z_$][\\w$]*\\.)+[A-Z][\\w$]*')
+    private static final Pattern JOIN = Pattern.compile('\\s*\\+\\s*')
+    private static final Pattern SELF_PROBE = Pattern.compile(
+            '(?<![\\w$.])(?:this\\s*\\.\\s*)?getClass\\s*\\(\\s*\\)\\s*\\.\\s*getDeclared(Field|Method)\\s*\\(\\s*(' + DQ + ')')
+    private static final Pattern NEW_THREAD = Pattern.compile('(?<![\\w$.])new\\s+Thread\\s*\\(')
+    private static final Pattern CURRENT_THREAD = Pattern.compile(
+            '(?<![\\w$.])Thread\\s*\\.\\s*currentThread\\s*\\(\\s*\\)\\s*\\.\\s*setName\\s*\\(\\s*(' + DQ + ')')
+    private static final Pattern THREAD_VAR = Pattern.compile('(?<![\\w$.])Thread\\s+([A-Za-z_$][\\w$]*)\\s*[=;,)]')
+    private static final Pattern STARTS_WITH = Pattern.compile('(?<![\\w$])startsWith\\s*\\(\\s*(' + DQ + ')')
+    private static final Pattern ABSTRACT_CHECK = Pattern.compile('(?<![\\w$.])abstract\\s[\\w$<>\\[\\].,\\s]*\\scheck\\s*\\(')
+    private static final Pattern INPUT_SCAN = Pattern.compile('startsWith\\s*\\(\\s*"INPUT_"\\s*\\)')
+    private static final Pattern INPUT_FIELD = Pattern.compile('[\\w$>\\]]\\s+(INPUT_[\\w$]*)\\s*(?:=[^;]*)?;')
+
+    private static final List<String> RESERVED_FQNS = [
+            'rip.vantage.security.ProofOfWork',
+            'com.alan.clients.util.vantage.HWIDUtil']
+    // Member names the client spells in a string literal and then looks up. Declaring one
+    // anywhere in this tree turns a lookup that has always failed into a live one. Keyed by
+    // name so each report says which check the name arms; a match is only a problem where a
+    // class DECLARES the member, not where some unrelated identifier happens to share the word.
+    private static final Map<String, String> RESERVED_MEMBERS = [
+            'getHWID':
+                    '  The client resolves a method of that name reflectively and hands the result\n' +
+                    '  to a machine-identity check that fails closed, so the name has to stay free.\n' +
+                    '  Use another one.',
+            'success':
+                    '  S2CPacketAuthentication reads a field of that name off itself and treats a\n' +
+                    '  hit as proof of tampering, then throttles the session. The shipped field was\n' +
+                    '  eQf and the lookup has never resolved. Use another name.',
+            'crash':
+                    '  ProtectionManager looks itself up for a method of that name and reads a hit\n' +
+                    '  as "not tampered with", which lets it go on to overwrite memory.\n' +
+                    '  pruned/hackclient/rise/aal never declared it. Use another name.',
+            'searchBar':
+                    '  RiseClickGUI looks the active click-GUI screen up for a field of that name.\n' +
+                    '  The shipped field was azM and the lookup failed, so the search box the GUI\n' +
+                    '  actually types into is the one the fallback loop finds. Naming a field\n' +
+                    '  searchBar -- which the neighbouring getSearchBar() invites -- changes that.\n' +
+                    '  Use another name.']
+    private static final Map<String, Integer> NAME_BUDGET = [
+            'ServerPacketHandler': 0, 'WebSocketClient': 0, 'BackendPacketEvent': 0, 'LoginMenu': 1]
+    private static final List<String> FORK_WORDS = [
+            'crack', 'qreaj', 'copeharder', 'bypass', 'agentthatcooks',
+            'cookingagent', 'riseagenttransformer', 'reisutil', 'cc.fish']
+    private static final List<String> FORK_EXEMPT = ['com.alan.clients', 'rip.vantage']
+    private static final String SCRIPT_SANDBOX = 'com.alan.clients.script.api'
+    private static final Map<String, Integer> THREAD_BUDGET = ['=agent': 0, 'debug': 0, 'test': 1, 'exploit': 0]
+    private static final int WIRED_CHECK_BUDGET = 3
+
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getSources()
+
+    @OutputFile
+    abstract RegularFileProperty getReport()
+
+    @TaskAction
+    void verify() {
+        List<ScannedFile> files = scan()
+        List<String> problems = new ArrayList<String>()
+
+        reservedClassNames(files, problems)
+        selfProbedMembers(files, problems)
+        reservedMemberNames(files, problems)
+        classNameBudget(files, problems)
+        forkPackages(files, problems)
+        scriptSandbox(files, problems)
+        threadNames(files, problems)
+        inputKeyFields(files, problems)
+        dormantProcessScan(files, problems)
+        wiredProtectionChecks(files, problems)
+
+        File out = report.get().asFile
+        out.parentFile.mkdirs()
+        if (problems.isEmpty()) {
+            out.setText('ok: ' + files.size() + ' files\n', 'UTF-8')
+            return
+        }
+        String message = (problems.size() == 1
+                ? 'A name in this tree is one the client itself reads back at runtime:'
+                : problems.size() + ' names in this tree are ones the client itself reads back at runtime:') +
+                '\n\n' + problems.join('\n\n') + '\n\n' +
+                'None of this is style. Each one turns a check that is dormant today into a live\n' +
+                'one, and the client takes that out on the user, not on the build.'
+        out.setText(message + '\n', 'UTF-8')
+        throw new GradleException(message)
+    }
+
+    private static String problem(List<String> where, String hit, String explanation) {
+        return where.join('\n') + '\n  ' + hit + '\n' + explanation
+    }
+
+    private List<ScannedFile> scan() {
+        List<File> all = new ArrayList<File>(sources.files)
+        Collections.sort(all)
+        List<ScannedFile> files = new ArrayList<ScannedFile>()
+        for (File f : all) {
+            files.add(read(f))
+        }
+        return files
+    }
+
+    private static ScannedFile read(File f) {
+        ScannedFile s = new ScannedFile()
+        s.path = f.path.replace('\\', '/')
+        int cut = s.path.indexOf('src/main/java/')
+        if (cut >= 0) {
+            s.path = s.path.substring(cut)
+        }
+
+        String src = f.getText('UTF-8')
+        StringBuilder code = new StringBuilder(src.length())
+        StringBuilder text = new StringBuilder(src.length())
+        Matcher m = TOKEN.matcher(src)
+        int last = 0
+        while (m.find()) {
+            String before = src.substring(last, m.start())
+            code.append(before)
+            text.append(before)
+            String tok = m.group()
+            char lead = tok.charAt(0)
+            if (lead == ('"' as char)) {
+                code.append('""')
+                text.append(tok)
+            } else if (lead == ("'" as char)) {
+                code.append("''")
+                text.append(tok)
+            } else {
+                for (int i = 0; i < tok.length(); i++) {
+                    if (tok.charAt(i) == ('\n' as char)) {
+                        code.append('\n' as char)
+                        text.append('\n' as char)
+                    }
+                }
+            }
+            last = m.end()
+        }
+        code.append(src.substring(last))
+        text.append(src.substring(last))
+        s.code = code.toString()
+        s.text = text.toString()
+
+        Matcher p = PACKAGE.matcher(s.code)
+        if (p.find()) {
+            s.pkg = p.group(1)
+        }
+        Matcher t = TYPE.matcher(s.code)
+        while (t.find()) {
+            s.types.add(t.group(1))
+            s.typeAt.add(Integer.valueOf(t.start(1)))
+        }
+        if (!s.types.isEmpty()) {
+            s.primary = s.types.get(0)
+        }
+        return s
+    }
+
+    private static String fqn(ScannedFile s, String type) {
+        return s.pkg.isEmpty() ? type : s.pkg + '.' + type
+    }
+
+    private static String at(ScannedFile s, String buffer, int index) {
+        int line = 1
+        for (int i = 0; i < index && i < buffer.length(); i++) {
+            if (buffer.charAt(i) == ('\n' as char)) {
+                line++
+            }
+        }
+        return s.path + ':' + line
+    }
+
+    private static String unquote(String literal) {
+        StringBuilder b = new StringBuilder()
+        int end = literal.length() - 1
+        for (int i = 1; i < end; i++) {
+            char c = literal.charAt(i)
+            if (c == ('\\' as char) && i + 1 < end) {
+                char n = literal.charAt(++i)
+                if (n == ('n' as char)) {
+                    b.append('\n' as char)
+                } else if (n == ('t' as char)) {
+                    b.append('\t' as char)
+                } else {
+                    b.append(n)
+                }
+            } else {
+                b.append(c)
+            }
+        }
+        return b.toString()
+    }
+
+    private static Pattern word(String name) {
+        return Pattern.compile('(?<![\\w$])' + Pattern.quote(name) + '(?![\\w$])')
+    }
+
+    private static int declaresMember(ScannedFile s, String name, boolean method) {
+        String tail = method ? '\\s*\\([^;{]*\\)\\s*(?:throws[^;{]*)?[{;]' : '\\s*(?:=[^;]*)?;'
+        Matcher m = Pattern.compile('[\\w$>\\]]\\s+(' + Pattern.quote(name) + ')' + tail).matcher(s.code)
+        return m.find() ? m.start(1) : -1
+    }
+
+    private static String firstReference(List<ScannedFile> files, ScannedFile owner, String type) {
+        for (ScannedFile s : files) {
+            if (s.path == owner.path || !s.code.contains(type)) {
+                continue
+            }
+            Matcher m = word(type).matcher(s.code)
+            if (m.find()) {
+                return at(s, s.code, m.start())
+            }
+        }
+        return null
+    }
+
+    private static int skipLiteral(String text, int start) {
+        char quote = text.charAt(start)
+        int i = start + 1
+        while (i < text.length()) {
+            char c = text.charAt(i)
+            if (c == ('\\' as char)) {
+                i += 2
+                continue
+            }
+            if (c == quote) {
+                return i + 1
+            }
+            i++
+        }
+        return text.length()
+    }
+
+    private static int closingParen(String text, int open) {
+        int depth = 0
+        int i = open
+        while (i < text.length()) {
+            char c = text.charAt(i)
+            if (c == ('"' as char) || c == ("'" as char)) {
+                i = skipLiteral(text, i)
+                continue
+            }
+            if (c == ('(' as char) || c == ('[' as char) || c == ('{' as char)) {
+                depth++
+            } else if (c == (')' as char) || c == (']' as char) || c == ('}' as char)) {
+                depth--
+                if (depth == 0) {
+                    return i
+                }
+            }
+            i++
+        }
+        return -1
+    }
+
+    private static List<String> arguments(String text, int from, int to) {
+        List<String> args = new ArrayList<String>()
+        int depth = 0
+        int start = from
+        int i = from
+        while (i < to) {
+            char c = text.charAt(i)
+            if (c == ('"' as char) || c == ("'" as char)) {
+                i = skipLiteral(text, i)
+                continue
+            }
+            if (c == ('(' as char) || c == ('[' as char) || c == ('{' as char)) {
+                depth++
+            } else if (c == (')' as char) || c == (']' as char) || c == ('}' as char)) {
+                depth--
+            } else if (c == (',' as char) && depth == 0) {
+                args.add(text.substring(start, i))
+                start = i + 1
+            }
+            i++
+        }
+        args.add(text.substring(start, to))
+        return args
+    }
+
+    private static List<String> builtStrings(String text) {
+        List<String> out = new ArrayList<String>()
+        Matcher m = CHAR_ARRAY.matcher(text)
+        StringBuilder acc = new StringBuilder()
+        int previousEnd = -1
+        while (m.find()) {
+            if (previousEnd >= 0 && !JOIN.matcher(text.substring(previousEnd, m.start())).matches()) {
+                out.add(acc.toString())
+                acc = new StringBuilder()
+            }
+            Matcher c = CHAR_LIT.matcher(m.group(1))
+            while (c.find()) {
+                acc.append(unquote('"' + c.group(1) + '"'))
+            }
+            previousEnd = m.end()
+        }
+        if (previousEnd >= 0) {
+            out.add(acc.toString())
+        }
+        return out
+    }
+
+    private static void reservedClassNames(List<ScannedFile> files, List<String> problems) {
+        Set<String> reserved = new LinkedHashSet<String>(RESERVED_FQNS)
+        for (ScannedFile s : files) {
+            for (String built : builtStrings(s.text)) {
+                if (FQN.matcher(built).matches()) {
+                    reserved.add(built)
+                }
+            }
+        }
+        for (ScannedFile s : files) {
+            for (int i = 0; i < s.types.size(); i++) {
+                String name = fqn(s, s.types.get(i))
+                if (!reserved.contains(name)) {
+                    continue
+                }
+                problems.add(problem([at(s, s.code, s.typeAt.get(i).intValue())], 'class ' + name,
+                        '  The client puts that exact name back together and loads it at runtime, so\n' +
+                        '  creating the class turns a lookup that fails today into a live call into\n' +
+                        '  your code, on a path no -Drise.protection.* toggle covers.\n' +
+                        '  Use another name, or another package.'))
+            }
+        }
+    }
+
+    private static void selfProbedMembers(List<ScannedFile> files, List<String> problems) {
+        for (ScannedFile s : files) {
+            Set<String> seen = new LinkedHashSet<String>()
+            Matcher m = SELF_PROBE.matcher(s.text)
+            while (m.find()) {
+                boolean method = m.group(1) == 'Method'
+                String name = unquote(m.group(2))
+                int declared = declaresMember(s, name, method)
+                if (declared < 0 || !seen.add(m.group(1) + ' ' + name)) {
+                    continue
+                }
+                problems.add(problem([at(s, s.code, declared)],
+                        (method ? 'method ' : 'field ') + name + ' on ' + fqn(s, s.primary),
+                        '  This class looks itself up for a member of that name and reads a hit as\n' +
+                        '  having been tampered with; it then works to make itself unusable for the\n' +
+                        '  user. Rename the member.'))
+            }
+        }
+    }
+
+    private static void reservedMemberNames(List<ScannedFile> files, List<String> problems) {
+        for (Map.Entry<String, String> rule : RESERVED_MEMBERS.entrySet()) {
+            String member = rule.key
+            for (ScannedFile s : files) {
+                if (!s.code.contains(member)) {
+                    continue
+                }
+                int field = declaresMember(s, member, false)
+                int method = declaresMember(s, member, true)
+                boolean asField = field >= 0 && (method < 0 || field <= method)
+                int declared = asField ? field : method
+                if (declared < 0) {
+                    continue
+                }
+                problems.add(problem([at(s, s.code, declared)],
+                        (asField ? 'field ' : 'method ') + member +
+                                (s.primary == null ? '' : ' on ' + fqn(s, s.primary)),
+                        rule.value))
+            }
+        }
+    }
+
+    private static void classNameBudget(List<ScannedFile> files, List<String> problems) {
+        for (Map.Entry<String, Integer> rule : NAME_BUDGET.entrySet()) {
+            String needle = rule.key
+            int budget = rule.value.intValue()
+            List<String> where = new ArrayList<String>()
+            for (ScannedFile s : files) {
+                for (int i = 0; i < s.types.size(); i++) {
+                    if (fqn(s, s.types.get(i)).contains(needle)) {
+                        where.add(at(s, s.code, s.typeAt.get(i).intValue()))
+                    }
+                }
+            }
+            if (where.size() <= budget) {
+                continue
+            }
+            problems.add(problem(where,
+                    'class names containing "' + needle + '": found ' + where.size() + ', allowed ' + budget,
+                    '  The client matches that text against its own call stack and answers a match\n' +
+                    '  by making itself slow for the user. Rename the class.'))
+        }
+    }
+
+    private static void forkPackages(List<ScannedFile> files, List<String> problems) {
+        for (ScannedFile s : files) {
+            for (int i = 0; i < s.types.size(); i++) {
+                String name = fqn(s, s.types.get(i))
+                String low = name.toLowerCase(Locale.ROOT)
+                String hit = FORK_WORDS.find { String w -> low.contains(w) }
+                if (hit == null || FORK_EXEMPT.any { String p -> low.startsWith(p) }) {
+                    continue
+                }
+                problems.add(problem([at(s, s.code, s.typeAt.get(i).intValue())],
+                        name + ' contains "' + hit + '"',
+                        '  A name like that is only safe under ' + FORK_EXEMPT.join(' and ') + '. Anywhere\n' +
+                        '  else the client reads it off its own call stack as proof it is running\n' +
+                        '  cracked, and degrades itself. Keep the package, or rename the class.'))
+            }
+        }
+    }
+
+    private static void scriptSandbox(List<ScannedFile> files, List<String> problems) {
+        List<ScannedFile> filters = files.findAll { ScannedFile s -> s.code.contains('exposeToScripts') }
+        if (filters.size() != 1) {
+            problems.add(problem([filters.isEmpty() ? 'src/main/java' : filters.get(0).path],
+                    'script class filters: found ' + filters.size() + ', expected 1',
+                    '  That filter is the only thing standing between a user script and the rest of\n' +
+                    '  the client. Keep exactly one.'))
+            return
+        }
+        ScannedFile filter = filters.get(0)
+        List<String> prefixes = new ArrayList<String>()
+        Matcher m = STARTS_WITH.matcher(filter.text)
+        while (m.find()) {
+            prefixes.add(unquote(m.group(1)))
+        }
+        if (prefixes.size() != 1 || prefixes.get(0) != SCRIPT_SANDBOX) {
+            problems.add(problem([filter.path],
+                    'script sandbox allows ' + prefixes + ', expected [' + SCRIPT_SANDBOX + ']',
+                    '  A wider prefix hands user scripts the parts of the client the sandbox exists\n' +
+                    '  to keep them out of, and a narrower one is not the sandbox any more.\n' +
+                    '  Restore it exactly.'))
+            return
+        }
+        if (!files.any { ScannedFile s -> s.pkg == SCRIPT_SANDBOX }) {
+            problems.add(problem([filter.path],
+                    'script sandbox allows ' + SCRIPT_SANDBOX + ', which is now empty',
+                    '  Move the package and the prefix in the same change, or user scripts silently\n' +
+                    '  lose every call they have.'))
+        }
+    }
+
+    private static Map<Integer, String> threadNameSites(ScannedFile s) {
+        Map<Integer, String> out = new LinkedHashMap<Integer, String>()
+        Matcher m = NEW_THREAD.matcher(s.text)
+        while (m.find()) {
+            int open = m.end() - 1
+            int close = closingParen(s.text, open)
+            if (close < 0) {
+                continue
+            }
+            for (String arg : arguments(s.text, open + 1, close)) {
+                if (!arg.trim().startsWith('"')) {
+                    continue
+                }
+                Matcher lit = STRING.matcher(arg)
+                while (lit.find()) {
+                    out.put(Integer.valueOf(m.start()), unquote(lit.group()))
+                }
+            }
+        }
+        Matcher c = CURRENT_THREAD.matcher(s.text)
+        while (c.find()) {
+            out.put(Integer.valueOf(c.start()), unquote(c.group(1)))
+        }
+        Set<String> vars = new LinkedHashSet<String>()
+        Matcher v = THREAD_VAR.matcher(s.code)
+        while (v.find()) {
+            vars.add(v.group(1))
+        }
+        for (String name : vars) {
+            Matcher n = Pattern.compile('(?<![\\w$.])(?:this\\s*\\.\\s*)?' + Pattern.quote(name) +
+                    '\\s*\\.\\s*setName\\s*\\(\\s*(' + DQ + ')').matcher(s.text)
+            while (n.find()) {
+                out.put(Integer.valueOf(n.start()), unquote(n.group(1)))
+            }
+        }
+        return out
+    }
+
+    private static void threadNames(List<ScannedFile> files, List<String> problems) {
+        for (Map.Entry<String, Integer> rule : THREAD_BUDGET.entrySet()) {
+            boolean exact = rule.key.startsWith('=')
+            String needle = exact ? rule.key.substring(1) : rule.key
+            int budget = rule.value.intValue()
+            List<String> where = new ArrayList<String>()
+            List<String> names = new ArrayList<String>()
+            for (ScannedFile s : files) {
+                for (Map.Entry<Integer, String> site : threadNameSites(s).entrySet()) {
+                    String name = site.value
+                    if (exact ? name == needle : name.contains(needle)) {
+                        where.add(at(s, s.text, site.key.intValue()))
+                        names.add('"' + name + '"')
+                    }
+                }
+            }
+            if (where.size() <= budget) {
+                continue
+            }
+            problems.add(problem(where,
+                    'thread names ' + (exact ? 'equal to' : 'containing') + ' "' + needle + '": found ' +
+                            where.size() + ', allowed ' + budget + ' -- ' + names.join(', '),
+                    '  The client reads the names of its own threads and answers a match by making\n' +
+                    '  itself slow for the user. Rename the thread.'))
+        }
+    }
+
+    private static void inputKeyFields(List<ScannedFile> files, List<String> problems) {
+        for (ScannedFile s : files) {
+            if (s.primary == null || !INPUT_SCAN.matcher(s.text).find()) {
+                continue
+            }
+            Matcher m = INPUT_FIELD.matcher(s.code)
+            int count = 0
+            int first = -1
+            while (m.find()) {
+                count++
+                if (first < 0) {
+                    first = m.start(1)
+                }
+            }
+            if (count == 0 || firstReference(files, s, s.primary) != null) {
+                continue
+            }
+            problems.add(problem([at(s, s.code, first)],
+                    count + ' INPUT_ fields on ' + fqn(s, s.primary),
+                    '  This class fills a key table from its own INPUT_ field names, nothing outside\n' +
+                    '  the file reads that table, and a prefix shorter than the original one breaks\n' +
+                    '  its initialiser. Wire the accessors up in the same change, or leave the\n' +
+                    '  fields as they are.'))
+        }
+    }
+
+    private static void dormantProcessScan(List<ScannedFile> files, List<String> problems) {
+        for (ScannedFile s : files) {
+            if (s.primary == null || !s.text.toLowerCase(Locale.ROOT).contains('tasklist')) {
+                continue
+            }
+            String caller = firstReference(files, s, s.primary)
+            if (caller == null) {
+                continue
+            }
+            problems.add(problem([caller], 'first caller of ' + fqn(s, s.primary),
+                    '  That class walks the operating system process list and matches it against a\n' +
+                    '  name. It has had no caller since this client was opened up, and no\n' +
+                    '  -Drise.protection.* toggle covers it. Put it behind one first.'))
+        }
+    }
+
+    private static void wiredProtectionChecks(List<ScannedFile> files, List<String> problems) {
+        Set<String> bases = new LinkedHashSet<String>()
+        for (ScannedFile s : files) {
+            if (s.primary != null && ABSTRACT_CHECK.matcher(s.code).find()) {
+                bases.add(s.primary)
+            }
+        }
+        if (bases.isEmpty()) {
+            return
+        }
+        List<String> wired = new ArrayList<String>()
+        List<String> where = new ArrayList<String>()
+        for (ScannedFile s : files) {
+            if (s.primary == null) {
+                continue
+            }
+            boolean subclass = bases.any { String b ->
+                Pattern.compile('(?<![\\w$.])extends\\s+(?:[\\w$]+\\.)*' + Pattern.quote(b) + '(?![\\w$])')
+                        .matcher(s.code).find()
+            }
+            if (!subclass) {
+                continue
+            }
+            String caller = firstReference(files, s, s.primary)
+            if (caller != null) {
+                wired.add(s.primary)
+                where.add(caller + '  (' + s.primary + ')')
+            }
+        }
+        if (wired.size() <= WIRED_CHECK_BUDGET) {
+            return
+        }
+        problems.add(problem(where,
+                'protection checks wired in: found ' + wired.size() + ', allowed ' + WIRED_CHECK_BUDGET,
+                '  The ones left unreferenced end the session or take the controls off the\n' +
+                '  player, and no -Drise.protection.* toggle covers them. Leave them\n' +
+                '  unreferenced.'))
+    }
+}

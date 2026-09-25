@@ -1,0 +1,213 @@
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+
+// A class name can also arrive as a string literal inside the prebuilt jars, where no gate in
+// this project can see it: javac sees a String, refpatch holds a Utf8 back when its only role is
+// CONSTANT_String, and DanglingRefs / LoadVerify / equiv_gate / selfcheck all walk type
+// references. Rise's obfuscator did not adapt literals, so the ones under an owned root name
+// PRE-obfuscation classes and have been dead since before this tree existed. This task keeps
+// them dead.
+
+def staleLiterals = tasks.register('staleLiterals', StaleLiteralsCheck) {
+    group = 'verification'
+    description = 'Fail the build on a class-name literal inside libs/ that has started to resolve.'
+    jars.from(fileTree('libs') { include '*.jar' })
+    sources.from(fileTree('src/main/java') { include '**/*.java' })
+    report = layout.buildDirectory.file('reports/stale-literals.txt')
+}
+
+plugins.withId('java') {
+    tasks.named('check') { dependsOn staleLiterals }
+}
+
+@groovy.transform.CompileStatic
+abstract class StaleLiteralsCheck extends DefaultTask {
+
+    // Roots this project owns. A literal under one of these names a Rise class; anything else in
+    // the pool is vanilla, OptiFine or a library and is none of our business.
+    private static final List<String> ROOTS = [
+            'hackclient.', 'com.alan.clients.', 'rip.vantage.', 'de.florianmichael.']
+
+    // Deliberately case-insensitive in the last segment, unlike a normal FQN pattern: the names
+    // that matter here are obfuscated ones like `hackclient.rise.ya`, and a pattern demanding an
+    // uppercase class name would miss every single one of them.
+    private static final Pattern DOTTED = Pattern.compile('[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)+')
+
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getJars()
+
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getSources()
+
+    @OutputFile
+    abstract RegularFileProperty getReport()
+
+    @TaskAction
+    void verify() {
+        Set<String> known = knownTypeNames()
+        List<String> problems = new ArrayList<String>()
+        List<String> dormant = new ArrayList<String>()
+        int scanned = 0
+
+        for (File jar : new TreeSet<File>(jars.files)) {
+            ZipFile zf = new ZipFile(jar)
+            try {
+                Enumeration<? extends ZipEntry> en = zf.entries()
+                while (en.hasMoreElements()) {
+                    ZipEntry e = en.nextElement()
+                    if (!e.name.endsWith('.class')) {
+                        continue
+                    }
+                    scanned++
+                    List<String> lits
+                    try {
+                        lits = stringConstants(zf.getInputStream(e).bytes)
+                    } catch (Exception ignored) {
+                        continue    // a pool we cannot read is not evidence of anything
+                    }
+                    for (String s : lits) {
+                        if (!owned(s) || !DOTTED.matcher(s).matches()) {
+                            continue
+                        }
+                        String where = jar.name + '  ' + e.name
+                        if (known.contains(s)) {
+                            problems.add(problem(where, s))
+                        } else {
+                            dormant.add(where + '  "' + s + '"')
+                        }
+                    }
+                }
+            } finally {
+                zf.close()
+            }
+        }
+
+        Collections.sort(dormant)
+        File out = report.get().asFile
+        out.parentFile.mkdirs()
+        if (problems.isEmpty()) {
+            out.setText('ok: ' + scanned + ' class files, ' + known.size() + ' known type names, ' +
+                    new LinkedHashSet<String>(dormant).size() + ' dormant literal(s)\n' +
+                    new LinkedHashSet<String>(dormant).join('\n') + '\n', 'UTF-8')
+            return
+        }
+        String message = (problems.size() == 1
+                ? 'A class-name literal inside libs/ has started to resolve:'
+                : problems.size() + ' class-name literals inside libs/ have started to resolve:') +
+                '\n\n' + new LinkedHashSet<String>(problems).join('\n\n') + '\n\n' +
+                'These literals are not references. Nothing in the build can see them, which is\n' +
+                'why the OreESP one has been read as a fixable leftover twice. Keep them dead.'
+        out.setText(message + '\n', 'UTF-8')
+        throw new GradleException(message)
+    }
+
+    private static String problem(String where, String literal) {
+        return where + '\n  literal "' + literal + '"\n' +
+                '  That string named a class before Rise obfuscated this client, and the shipped\n' +
+                '  client had no class of that name -- the lookup around it threw on its first\n' +
+                '  instruction in every build that ever shipped, and the code it guards has never\n' +
+                '  run once. Something now answers to the name, so the lookup succeeds and that\n' +
+                '  code runs for the first time.\n' +
+                '  Two ways to get here: rewriting the literal in the jar to a name this tree has,\n' +
+                '  or giving a class the old name back. Undo whichever it was. If the intent is to\n' +
+                '  turn the path on deliberately, it needs a RevivedPaths switch and a decision\n' +
+                '  recorded in recovery-kit/docs/05-findings.md, not a resolving literal.'
+    }
+
+    private static boolean owned(String s) {
+        for (String r : ROOTS) {
+            if (s.startsWith(r)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /** Every type name this build could resolve: the jars' own classes plus the source tree. */
+    private Set<String> knownTypeNames() {
+        Set<String> out = new HashSet<String>()
+        for (File jar : jars.files) {
+            ZipFile zf = new ZipFile(jar)
+            try {
+                Enumeration<? extends ZipEntry> en = zf.entries()
+                while (en.hasMoreElements()) {
+                    String n = en.nextElement().name
+                    if (n.endsWith('.class')) {
+                        out.add(n.substring(0, n.length() - 6).replace('/', '.'))
+                    }
+                }
+            } finally {
+                zf.close()
+            }
+        }
+        for (File f : sources.files) {
+            String p = f.path.replace('\\', '/')
+            int cut = p.indexOf('src/main/java/')
+            if (cut < 0) {
+                continue
+            }
+            out.add(p.substring(cut + 'src/main/java/'.length(), p.length() - 5).replace('/', '.'))
+        }
+        return out
+    }
+
+    /**
+     * The values of every CONSTANT_String in a class file.
+     *
+     * Hand-rolled rather than pulled from ASM because the build has no ASM dependency and this
+     * needs one field of one tag. The long/double two-slot rule is the only subtlety, and getting
+     * it wrong silently shifts every later index.
+     */
+    private static List<String> stringConstants(byte[] d) {
+        ByteBuffer b = ByteBuffer.wrap(d).order(ByteOrder.BIG_ENDIAN)
+        b.position(8)
+        int n = b.getShort() & 0xFFFF
+        Map<Integer, String> utf = new HashMap<Integer, String>()
+        List<Integer> refs = new ArrayList<Integer>()
+        int i = 1
+        while (i < n) {
+            int tag = b.get() & 0xFF
+            switch (tag) {
+                case 1:
+                    int len = b.getShort() & 0xFFFF
+                    byte[] raw = new byte[len]
+                    b.get(raw)
+                    utf.put(Integer.valueOf(i), new String(raw, 'UTF-8'))
+                    break
+                case 8:
+                    refs.add(Integer.valueOf(b.getShort() & 0xFFFF))
+                    break
+                case 7: case 16: case 19: case 20:
+                    b.position(b.position() + 2)
+                    break
+                case 15:
+                    b.position(b.position() + 3)
+                    break
+                case 3: case 4: case 9: case 10: case 11: case 12: case 17: case 18:
+                    b.position(b.position() + 4)
+                    break
+                case 5: case 6:
+                    b.position(b.position() + 8)
+                    i++            // long and double take two pool slots
+                    break
+                default:
+                    throw new IllegalStateException('constant pool tag ' + tag + ' at slot ' + i)
+            }
+            i++
+        }
+        List<String> out = new ArrayList<String>()
+        for (Integer r : refs) {
+            String v = utf.get(r)
+            if (v != null) {
+                out.add(v)
+            }
+        }
+        return out
+    }
+}

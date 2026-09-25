@@ -1,0 +1,10 @@
+* text=auto eol=lf
+
+*.png  binary
+*.ttf  binary
+*.jar  binary
+*.ogg  binary
+*.dat  binary
+*.bin  binary
+*.fsh  text eol=lf
+*.vsh  text eol=lf

@@ -1,0 +1,948 @@
+import groovy.json.JsonSlurper
+
+import javax.inject.Inject
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import java.util.zip.ZipFile
+
+plugins {
+    id 'java'
+    id 'idea'
+}
+
+group = 'com.alan.clients'
+version = '6.9.5'
+
+idea { module { excludeDirs += file('run') } }
+
+apply from: "$rootDir/gradle/reserved-names.gradle"
+apply from: "$rootDir/gradle/stale-literals.gradle"
+apply from: "$rootDir/gradle/mixed-box-merge.gradle"
+apply from: "$rootDir/gradle/launcher-version.gradle"
+
+repositories {
+    mavenCentral()
+}
+
+def minecraftVersion = '1.8.9'
+def versionManifestUrl = 'https://launchermeta.mojang.com/mc/game/version_manifest.json'
+def minecraftClientSha1 = '3870888a6c3d349d3771a3e9d16c9bf5e076b908'
+
+def minecraftJarCache = new File(gradle.gradleUserHomeDir,
+        "caches/rise-game-assets/minecraft-${minecraftVersion}-client.jar")
+
+def gameAssetsDir = layout.buildDirectory.dir('generated/game-assets')
+
+def optifineJar = providers.gradleProperty('optifineJar')
+        .map { file(it) }
+        .getOrElse(
+                fileTree('libs') { include 'OptiFine*.jar', 'optifine*.jar' }
+                        .files.sort { it.name }.find { true })
+
+def downloadMinecraftClient = tasks.register('downloadMinecraftClient', DownloadMojangClient) {
+    group = 'game assets'
+    description = "Download and verify the official Minecraft ${minecraftVersion} client jar."
+    versionId = minecraftVersion
+    manifestUrl = versionManifestUrl
+    expectedSha1 = minecraftClientSha1
+    destination = minecraftJarCache
+    offlineMode = gradle.startParameter.offline
+    suppliedJarPath = providers.gradleProperty('minecraftJar')
+    outputs.upToDateWhen { task -> task.destination.get().asFile.isFile() }
+}
+
+def extractMinecraftAssets = tasks.register('extractMinecraftAssets', ExtractGameAssets) {
+    group = 'game assets'
+    description = 'Extract assets/** from the official Minecraft client jar.'
+    archive.from(downloadMinecraftClient.flatMap { it.destination })
+    outputDir = gameAssetsDir.map { it.dir('minecraft') }
+}
+
+def extractOptifineAssets = tasks.register('extractOptifineAssets', ExtractGameAssets) {
+    group = 'game assets'
+    description = 'Extract assets/** from an OptiFine jar, if one was supplied.'
+    outputDir = gameAssetsDir.map { it.dir('optifine') }
+    missingArchiveWarning = 'OptiFine jar not found - building without OptiFine assets. ' +
+            'Pass -PoptifineJar=<path> or drop OptiFine*.jar into libs/.'
+    if (optifineJar != null) {
+        archive.from(optifineJar)
+    } else {
+        outputs.upToDateWhen { false }
+    }
+}
+
+tasks.register('gameAssets') {
+    group = 'game assets'
+    description = 'Fetch and extract every third-party asset the client needs.'
+    dependsOn extractMinecraftAssets, extractOptifineAssets
+}
+
+def requiredLocalJars = files('libs/minecraft-deobf.jar', 'libs/libraries.jar')
+
+def checkLocalJars = tasks.register('checkLocalJars') {
+    group = 'verification'
+    description = 'Fail early and readably when a libs/ jar is missing.'
+    def jars = requiredLocalJars
+    doLast {
+        def missing = jars.files.findAll { !it.isFile() }
+        if (!missing.isEmpty()) {
+            throw new GradleException(
+                    "Missing binary dependency:\n" +
+                    missing.collect { "  - ${it}" }.join('\n') + "\n\n" +
+                    "These jars are committed to the repository; restore them with\n" +
+                    "  git checkout -- libs\n" +
+                    "or clone again.")
+        }
+    }
+}
+
+dependencies {
+    implementation files('libs/minecraft-deobf.jar')
+    implementation files('libs/libraries.jar')
+
+    // compileOnly on purpose: no annotation processor
+    compileOnly 'org.projectlombok:lombok:1.18.22'
+}
+
+sourceSets {
+    main {
+        java { srcDirs = ['src/main/java'] }
+        resources {
+            // srcDir order is load-bearing: first in wins
+            srcDirs = ['src/main/resources']
+            srcDir extractOptifineAssets.flatMap { it.outputDir }
+            srcDir extractMinecraftAssets.flatMap { it.outputDir }
+        }
+    }
+}
+
+tasks.named('processResources') {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    dependsOn extractMinecraftAssets, extractOptifineAssets
+}
+
+tasks.named('compileJava') {
+    dependsOn checkLocalJars
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 21
+    options.compilerArgs += ['-nowarn', '-Xmaxerrs', '100000']
+}
+
+tasks.register('clientJar', Jar) {
+    archiveBaseName = 'rise-client'
+    archiveVersion = ''
+    destinationDirectory = layout.buildDirectory.dir('dist')
+    manifest { attributes 'Main-Class': 'Start' }
+    // from order is load-bearing: first in wins
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    from sourceSets.main.output
+    from zipTree('libs/minecraft-deobf.jar')
+}
+
+// source checks run on the documented build path, not only on `check`
+tasks.named('clientJar') { dependsOn 'reservedNames', 'staleLiterals', 'mixedBoxMerge' }
+
+build.dependsOn 'clientJar'
+
+def javaExecutableProperty = providers.gradleProperty('javaExecutable').getOrNull()
+def javaHomeEnv = providers.environmentVariable('JAVA_HOME').getOrNull()
+def gameDir = file('run')
+
+def minecraftVersionJsonSha1 = 'd546f1707a3f2b7d034eece5ea2e311eda875787'
+def assetObjectBaseUrl = 'https://resources.download.minecraft.net'
+
+def versionJsonCache = new File(gradle.gradleUserHomeDir,
+        "caches/rise-game-assets/minecraft-${minecraftVersion}.json")
+def assetObjectCache = new File(gradle.gradleUserHomeDir, 'caches/rise-game-assets/assets')
+def nativeLibraryCache = new File(gradle.gradleUserHomeDir, 'caches/rise-game-assets/libraries')
+
+def localMinecraftDir = providers.gradleProperty('minecraftDir')
+def offlineBuild = gradle.startParameter.offline
+
+def osName = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+def mojangOs = osName.contains('win') ? 'windows' : (osName.contains('mac') ? 'osx' : 'linux')
+def mojangArch = System.getProperty('sun.arch.data.model', '64') == '32' ? '32' : '64'
+
+def downloadVersionMetadata = tasks.register('downloadVersionMetadata', DownloadVersionMetadata) {
+    group = 'game directory'
+    description = "Download and verify the official Minecraft ${minecraftVersion} version metadata."
+    versionId = minecraftVersion
+    manifestUrl = versionManifestUrl
+    expectedSha1 = minecraftVersionJsonSha1
+    destination = versionJsonCache
+    offlineMode = offlineBuild
+    localInstall = localMinecraftDir
+    outputs.upToDateWhen { task -> task.destination.get().asFile.isFile() }
+}
+
+def gameDirAssets = tasks.register('gameDirAssets', ProvisionGameAssets) {
+    group = 'game directory'
+    description = 'Install the asset index and its objects into run/assets.'
+    versionJson = downloadVersionMetadata.flatMap { it.destination }
+    objectBaseUrl = assetObjectBaseUrl
+    assetsDir = new File(gameDir, 'assets')
+    cacheDir = assetObjectCache
+    stamp = layout.buildDirectory.file('game-dir/assets.stamp')
+    offlineMode = offlineBuild
+    localInstall = localMinecraftDir
+    outputs.upToDateWhen { task -> task.checkInstalled() }
+}
+
+def gameDirNatives = tasks.register('gameDirNatives', ProvisionGameNatives) {
+    group = 'game directory'
+    description = 'Extract the LWJGL natives for this operating system into run/natives.'
+    versionJson = downloadVersionMetadata.flatMap { it.destination }
+    targetOs = mojangOs
+    targetArch = mojangArch
+    nativesDir = new File(gameDir, 'natives')
+    cacheDir = nativeLibraryCache
+    stamp = layout.buildDirectory.file('game-dir/natives.stamp')
+    offlineMode = offlineBuild
+    localInstall = localMinecraftDir
+    outputs.upToDateWhen { task -> task.checkInstalled() }
+}
+
+def provisionGameDir = tasks.register('gameDir') {
+    group = 'game directory'
+    description = 'Provision run/ with the assets and natives the client cannot start without.'
+    dependsOn gameDirAssets, gameDirNatives
+}
+
+tasks.register('run', JavaExec) {
+    dependsOn provisionGameDir
+    group = 'application'
+    description = 'Run the client against the local run/ game directory.'
+    mainClass = 'Start'
+    classpath = sourceSets.main.runtimeClasspath
+    workingDir = gameDir
+    jvmArgs "-Drise.gameDir=${gameDir}",
+            "-Djava.library.path=${new File(gameDir, 'natives')}"
+
+    doFirst {
+        if (!gameDir.isDirectory() || !new File(gameDir, 'natives').isDirectory()) {
+            throw new GradleException(
+                    "The game directory ${gameDir} is missing or has no natives/ subdirectory.\n" +
+                    "Run './gradlew gameDir', or pass -PminecraftDir=<path to an existing 1.8.9 .minecraft>.")
+        }
+
+        def candidate = javaExecutableProperty
+        if (candidate == null && javaHomeEnv != null) {
+            def suffix = System.getProperty('os.name').toLowerCase().contains('windows')
+                    ? 'bin/java.exe' : 'bin/java'
+            candidate = new File(javaHomeEnv, suffix).absolutePath
+        }
+        if (candidate == null) {
+            throw new GradleException(
+                    "No JVM configured for the 'run' task.\n" +
+                    "Set JAVA_HOME to a JDK 21 or newer, or pass\n" +
+                    "  -PjavaExecutable=<jdk>/bin/java")
+        }
+        if (candidate.toLowerCase().replace('\\', '/').contains('risejdk')) {
+            throw new GradleException(
+                    "Unsupported JVM: ${candidate}\n" +
+                    "Set JAVA_HOME to a stock JDK 21 or newer, or pass\n" +
+                    "  -PjavaExecutable=<jdk>/bin/java")
+        }
+        if (!new File(candidate).isFile()) {
+            throw new GradleException("Java executable not found: ${candidate}")
+        }
+        executable = candidate
+    }
+}
+
+abstract class DownloadMojangClient extends DefaultTask {
+
+    @Input abstract Property<String> getVersionId()
+
+    @Input abstract Property<String> getManifestUrl()
+
+    @Input abstract Property<String> getExpectedSha1()
+
+    @OutputFile abstract RegularFileProperty getDestination()
+
+    @Internal abstract Property<Boolean> getOfflineMode()
+
+    @Internal abstract Property<String> getSuppliedJarPath()
+
+    @TaskAction
+    void fetch() {
+        File dest = destination.get().asFile
+        String want = expectedSha1.get().toLowerCase()
+
+        if (dest.isFile() && sha1(dest) == want) {
+            logger.info("Minecraft ${versionId.get()} client jar already cached: ${dest}")
+            return
+        }
+
+        if (suppliedJarPath.isPresent()) {
+            File supplied = new File(suppliedJarPath.get())
+            if (!supplied.isFile()) {
+                throw new GradleException("-PminecraftJar=${supplied} does not exist.")
+            }
+            String got = sha1(supplied)
+            if (got != want) {
+                throw new GradleException(
+                        "-PminecraftJar=${supplied} is not the official Minecraft ${versionId.get()} client jar.\n" +
+                        "  expected SHA-1 ${want}\n" +
+                        "  actual   SHA-1 ${got}\n" +
+                        "A jar rewritten by a mod installer will not do; point at the untouched\n" +
+                        "versions/${versionId.get()}/${versionId.get()}.jar of a vanilla launcher install.")
+            }
+            dest.parentFile.mkdirs()
+            Files.copy(supplied.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            logger.lifecycle("Using supplied Minecraft ${versionId.get()} client jar: ${supplied}")
+            return
+        }
+
+        if (offlineMode.get()) {
+            throw new GradleException(
+                    "Gradle is running with --offline and the Minecraft ${versionId.get()} client jar is not cached at\n" +
+                    "  ${dest}\n" +
+                    "Run once without --offline, or pass -PminecraftJar=<path to a vanilla ${versionId.get()}.jar>.")
+        }
+
+        Map client = resolveClientDownload()
+        String published = String.valueOf(client.sha1).toLowerCase()
+        if (published != want) {
+            throw new GradleException(
+                    "Mojang now publishes SHA-1 ${published} for the ${versionId.get()} client jar,\n" +
+                    "but this build expects ${want}. Refusing to download an unexpected artifact.\n" +
+                    "If the change is legitimate, update minecraftClientSha1 in build.gradle.")
+        }
+
+        String url = String.valueOf(client.url)
+        long size = client.size == null ? -1L : ((Number) client.size).longValue()
+        logger.lifecycle("Downloading Minecraft ${versionId.get()} client jar" +
+                (size > 0 ? " (${(size / 1048576d).round(1)} MB)" : '') + " from ${url}")
+
+        dest.parentFile.mkdirs()
+        File part = new File(dest.parentFile, dest.name + '.part')
+        MessageDigest digest = MessageDigest.getInstance('SHA-1')
+        try {
+            HttpURLConnection connection = openConnection(url)
+            int status = connection.responseCode
+            if (status != HttpURLConnection.HTTP_OK) {
+                throw new GradleException("${url} returned HTTP ${status} ${connection.responseMessage}")
+            }
+            connection.inputStream.withStream { input ->
+                part.withOutputStream { output ->
+                    byte[] buffer = new byte[65536]
+                    int read
+                    while ((read = input.read(buffer)) > 0) {
+                        digest.update(buffer, 0, read)
+                        output.write(buffer, 0, read)
+                    }
+                }
+            }
+        } catch (IOException e) {
+            part.delete()
+            throw new GradleException(describeNetworkFailure(url, e))
+        }
+
+        String got = digest.digest().encodeHex().toString()
+        if (got != want) {
+            part.delete()
+            throw new GradleException(
+                    "The downloaded client jar failed verification.\n" +
+                    "  expected SHA-1 ${want}\n" +
+                    "  actual   SHA-1 ${got}\n" +
+                    "The download was truncated or intercepted; nothing was installed.")
+        }
+        Files.move(part.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        logger.lifecycle("Verified and cached: ${dest}")
+    }
+
+    private Map resolveClientDownload() {
+        String manifest = manifestUrl.get()
+        def entry = parseJson(manifest).versions.find { it.id == versionId.get() }
+        if (entry == null) {
+            throw new GradleException("Version ${versionId.get()} is not listed in ${manifest}.")
+        }
+        def downloads = parseJson(String.valueOf(entry.url)).downloads
+        if (downloads?.client?.url == null) {
+            throw new GradleException("The ${versionId.get()} version manifest has no downloads.client entry.")
+        }
+        return (Map) downloads.client
+    }
+
+    private Object parseJson(String url) {
+        try {
+            HttpURLConnection connection = openConnection(url)
+            int status = connection.responseCode
+            if (status != HttpURLConnection.HTTP_OK) {
+                throw new GradleException("${url} returned HTTP ${status} ${connection.responseMessage}")
+            }
+            String body = connection.inputStream.withStream { it.getText('UTF-8') }
+            return new JsonSlurper().parseText(body)
+        } catch (IOException e) {
+            throw new GradleException(describeNetworkFailure(url, e))
+        }
+    }
+
+    private static HttpURLConnection openConnection(String url) {
+        HttpURLConnection connection = (HttpURLConnection) new URI(url).toURL().openConnection()
+        connection.connectTimeout = 15000
+        connection.readTimeout = 60000
+        connection.instanceFollowRedirects = true
+        connection.setRequestProperty('User-Agent', 'rise-client-build/gradle')
+        return connection
+    }
+
+    private String describeNetworkFailure(String url, Exception cause) {
+        return "Cannot reach ${url}\n" +
+                "  ${cause.class.simpleName}: ${cause.message}\n" +
+                "The build needs one online run to fetch the Minecraft ${versionId.get()} assets.\n" +
+                "Offline alternatives: -PminecraftJar=<path to a vanilla ${versionId.get()}.jar>,\n" +
+                "or copy a verified jar to ${destination.get().asFile}."
+    }
+
+    private static String sha1(File file) {
+        MessageDigest digest = MessageDigest.getInstance('SHA-1')
+        file.withInputStream { input ->
+            byte[] buffer = new byte[65536]
+            int read
+            while ((read = input.read(buffer)) > 0) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().encodeHex().toString()
+    }
+}
+
+abstract class ExtractGameAssets extends DefaultTask {
+
+    @InputFiles @Optional abstract ConfigurableFileCollection getArchive()
+
+    @OutputDirectory abstract DirectoryProperty getOutputDir()
+
+    @Input @Optional abstract Property<String> getMissingArchiveWarning()
+
+    @Inject abstract FileSystemOperations getFileSystem()
+
+    @Inject abstract ArchiveOperations getArchives()
+
+    @TaskAction
+    void extract() {
+        File target = outputDir.get().asFile
+        File jar = archive.files.find { it.isFile() }
+        if (jar == null) {
+            if (missingArchiveWarning.isPresent()) {
+                logger.warn(missingArchiveWarning.get())
+            }
+            fileSystem.delete { delete(target) }
+            target.mkdirs()
+            return
+        }
+        fileSystem.sync {
+            from(archives.zipTree(jar)) {
+                include 'assets/**'
+                exclude 'assets/minecraft/rise/**'
+            }
+            into(target)
+        }
+    }
+}
+
+class GameFiles {
+
+    static final int ATTEMPTS = 3
+
+    static Object json(String url) {
+        try {
+            HttpURLConnection connection = open(url)
+            int status = connection.responseCode
+            if (status != HttpURLConnection.HTTP_OK) {
+                throw new IOException("HTTP ${status} ${connection.responseMessage}")
+            }
+            return new JsonSlurper().parseText(connection.inputStream.withStream { it.getText('UTF-8') })
+        } catch (IOException e) {
+            throw new GradleException(unreachable(url, e))
+        }
+    }
+
+    static Object parse(File file) {
+        return new JsonSlurper().parse(file, 'UTF-8')
+    }
+
+    static void download(String url, File dest, String expectedSha1) {
+        File part = new File(dest.parentFile, dest.name + '.part')
+        Exception last = null
+        for (int attempt = 1; attempt <= ATTEMPTS; attempt++) {
+            try {
+                String got = fetch(url, part)
+                if (expectedSha1 != null && got != expectedSha1) {
+                    throw new IOException("SHA-1 ${got}, expected ${expectedSha1}")
+                }
+                Files.move(part.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                return
+            } catch (IOException e) {
+                last = e
+                part.delete()
+                if (attempt < ATTEMPTS) {
+                    Thread.sleep(300L * attempt)
+                }
+            }
+        }
+        throw new GradleException(unreachable(url, last))
+    }
+
+    private static String fetch(String url, File dest) {
+        dest.parentFile.mkdirs()
+        HttpURLConnection connection = open(url)
+        int status = connection.responseCode
+        if (status != HttpURLConnection.HTTP_OK) {
+            throw new IOException("HTTP ${status} ${connection.responseMessage}")
+        }
+        MessageDigest digest = MessageDigest.getInstance('SHA-1')
+        connection.inputStream.withStream { input ->
+            dest.withOutputStream { output ->
+                byte[] buffer = new byte[65536]
+                int read
+                while ((read = input.read(buffer)) > 0) {
+                    digest.update(buffer, 0, read)
+                    output.write(buffer, 0, read)
+                }
+            }
+        }
+        return digest.digest().encodeHex().toString()
+    }
+
+    private static HttpURLConnection open(String url) {
+        HttpURLConnection connection = (HttpURLConnection) new URI(url).toURL().openConnection()
+        connection.connectTimeout = 15000
+        connection.readTimeout = 60000
+        connection.instanceFollowRedirects = true
+        connection.setRequestProperty('User-Agent', 'rise-client-build/gradle')
+        return connection
+    }
+
+    static String unreachable(String url, Exception cause) {
+        return "Cannot reach ${url} (${cause.class.simpleName}: ${cause.message}) - the game directory " +
+                "needs one online run to fetch Mojang's assets and natives, or pass " +
+                "-PminecraftDir=<path to an existing 1.8.9 .minecraft> to copy them from a local install."
+    }
+
+    static String missingOffline(String what, File where) {
+        return "Gradle is running with --offline and ${what} is not cached at ${where} - run once " +
+                "without --offline, or pass -PminecraftDir=<path to an existing 1.8.9 .minecraft>."
+    }
+
+    static File localFile(String minecraftDir, String relative) {
+        if (minecraftDir == null) {
+            return null
+        }
+        File file = new File(new File(minecraftDir), relative)
+        return file.isFile() ? file : null
+    }
+
+    static String checkedLocalDir(Property<String> minecraftDir) {
+        String path = minecraftDir.getOrNull()
+        if (path != null && !new File(path).isDirectory()) {
+            throw new GradleException("-PminecraftDir=${path} is not a directory.")
+        }
+        return path
+    }
+
+    static void copy(File source, File dest) {
+        dest.parentFile.mkdirs()
+        Files.copy(source.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+    }
+
+    static String sha1(File file) {
+        MessageDigest digest = MessageDigest.getInstance('SHA-1')
+        file.withInputStream { input ->
+            byte[] buffer = new byte[65536]
+            int read
+            while ((read = input.read(buffer)) > 0) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().encodeHex().toString()
+    }
+
+    static String megabytes(long bytes) {
+        return (bytes / 1048576d).round(1) + ' MB'
+    }
+}
+
+abstract class DownloadVersionMetadata extends DefaultTask {
+
+    @Input abstract Property<String> getVersionId()
+
+    @Input abstract Property<String> getManifestUrl()
+
+    @Input abstract Property<String> getExpectedSha1()
+
+    @OutputFile abstract RegularFileProperty getDestination()
+
+    @Internal abstract Property<Boolean> getOfflineMode()
+
+    @Internal abstract Property<String> getLocalInstall()
+
+    @TaskAction
+    void fetch() {
+        File dest = destination.get().asFile
+        String want = expectedSha1.get().toLowerCase()
+        if (dest.isFile() && GameFiles.sha1(dest) == want) {
+            return
+        }
+
+        String id = versionId.get()
+        String local = GameFiles.checkedLocalDir(localInstall)
+        File supplied = GameFiles.localFile(local, "versions/${id}/${id}.json")
+        if (supplied != null && GameFiles.sha1(supplied) == want) {
+            GameFiles.copy(supplied, dest)
+            logger.lifecycle("Using ${supplied}")
+            return
+        }
+
+        if (offlineMode.get()) {
+            throw new GradleException(GameFiles.missingOffline("the Minecraft ${id} version metadata", dest))
+        }
+
+        String manifest = manifestUrl.get()
+        def entry = GameFiles.json(manifest).versions.find { it.id == id }
+        if (entry == null) {
+            throw new GradleException("Version ${id} is not listed in ${manifest}.")
+        }
+        GameFiles.download(String.valueOf(entry.url), dest, want)
+        logger.lifecycle("Verified and cached: ${dest}")
+    }
+}
+
+abstract class ProvisionGameAssets extends DefaultTask {
+
+    @InputFile abstract RegularFileProperty getVersionJson()
+
+    @Input abstract Property<String> getObjectBaseUrl()
+
+    @OutputFile abstract RegularFileProperty getStamp()
+
+    @Internal abstract DirectoryProperty getAssetsDir()
+
+    @Internal abstract DirectoryProperty getCacheDir()
+
+    @Internal abstract Property<Boolean> getOfflineMode()
+
+    @Internal abstract Property<String> getLocalInstall()
+
+    boolean checkInstalled() {
+        try {
+            File meta = versionJson.get().asFile
+            if (!meta.isFile() || !stamp.get().asFile.isFile()) {
+                return false
+            }
+            def assetIndex = GameFiles.parse(meta).assetIndex
+            File index = new File(assetsDir.get().asFile, "indexes/${assetIndex.id}.json")
+            if (!index.isFile() || GameFiles.sha1(index) != String.valueOf(assetIndex.sha1).toLowerCase()) {
+                return false
+            }
+            File objects = new File(assetsDir.get().asFile, 'objects')
+            return uniqueObjects(index).every { hash, size -> present(objects, hash, size) }
+        } catch (Exception ignored) {
+            return false
+        }
+    }
+
+    @TaskAction
+    void install() {
+        File assets = assetsDir.get().asFile
+        File cache = cacheDir.get().asFile
+        String local = GameFiles.checkedLocalDir(localInstall)
+
+        def assetIndex = GameFiles.parse(versionJson.get().asFile).assetIndex
+        String id = String.valueOf(assetIndex.id)
+        String indexSha1 = String.valueOf(assetIndex.sha1).toLowerCase()
+
+        File cachedIndex = new File(cache, "indexes/${id}.json")
+        if (!cachedIndex.isFile() || GameFiles.sha1(cachedIndex) != indexSha1) {
+            File supplied = GameFiles.localFile(local, "assets/indexes/${id}.json")
+            if (supplied != null && GameFiles.sha1(supplied) == indexSha1) {
+                GameFiles.copy(supplied, cachedIndex)
+            } else if (offlineMode.get()) {
+                throw new GradleException(GameFiles.missingOffline("the ${id} asset index", cachedIndex))
+            } else {
+                GameFiles.download(String.valueOf(assetIndex.url), cachedIndex, indexSha1)
+            }
+        }
+
+        Map<String, Long> objects = uniqueObjects(cachedIndex)
+        File cachedObjects = new File(cache, 'objects')
+        List<String> missing = objects.findAll { hash, size -> !present(cachedObjects, hash, size) }.keySet() as List
+
+        if (!missing.isEmpty() && local != null) {
+            missing = copyFromInstall(missing, objects, cachedObjects, local)
+        }
+        if (!missing.isEmpty()) {
+            if (offlineMode.get()) {
+                throw new GradleException(GameFiles.missingOffline(
+                        "${missing.size()} of the ${objects.size()} Minecraft asset objects are", cachedObjects))
+            }
+            downloadObjects(missing, objects, cachedObjects)
+        }
+
+        File index = new File(assets, "indexes/${id}.json")
+        if (!index.isFile() || GameFiles.sha1(index) != indexSha1) {
+            materialize(cachedIndex, index)
+        }
+        installObjects(objects, cachedObjects, new File(assets, 'objects'))
+
+        File file = stamp.get().asFile
+        file.parentFile.mkdirs()
+        file.text = "assets ${id} ${indexSha1} objects=${objects.size()}\n"
+    }
+
+    List<String> copyFromInstall(List<String> missing, Map<String, Long> objects, File cache, String local) {
+        List<String> remaining = []
+        int copied = 0
+        for (String hash : missing) {
+            File source = GameFiles.localFile(local, "assets/objects/${path(hash)}")
+            if (source != null && source.length() == objects[hash] && GameFiles.sha1(source) == hash) {
+                GameFiles.copy(source, new File(cache, path(hash)))
+                copied++
+            } else {
+                remaining << hash
+            }
+        }
+        if (copied > 0) {
+            logger.lifecycle("Copied ${copied} asset objects from ${local}")
+        }
+        return remaining
+    }
+
+    void downloadObjects(List<String> missing, Map<String, Long> objects, File cache) {
+        int total = missing.size()
+        long bytes = missing.inject(0L) { sum, hash -> sum + objects[hash] }
+        String base = objectBaseUrl.get()
+        logger.lifecycle("Downloading ${total} Minecraft asset objects (${GameFiles.megabytes(bytes)}) from ${base}")
+
+        int threads = Math.max(2, Math.min(8, Runtime.runtime.availableProcessors()))
+        int step = Math.max(1, (int) Math.ceil(total / 10.0d))
+        ExecutorService pool = Executors.newFixedThreadPool(threads)
+        AtomicInteger done = new AtomicInteger()
+        AtomicReference<String> failure = new AtomicReference<>()
+        try {
+            missing.collect { String hash ->
+                pool.submit({
+                    if (failure.get() != null) {
+                        return
+                    }
+                    try {
+                        GameFiles.download("${base}/${path(hash)}", new File(cache, path(hash)), hash)
+                    } catch (Exception e) {
+                        failure.compareAndSet(null, e.message ?: e.toString())
+                        return
+                    }
+                    int n = done.incrementAndGet()
+                    if (n % step == 0 || n == total) {
+                        logger.lifecycle("  ${Math.round(n * 100.0d / total)}% (${n}/${total})")
+                    }
+                } as Runnable)
+            }.each { it.get() }
+        } finally {
+            pool.shutdownNow()
+        }
+        if (failure.get() != null) {
+            throw new GradleException(failure.get())
+        }
+    }
+
+    void installObjects(Map<String, Long> objects, File cache, File target) {
+        int installed = 0
+        boolean copying = false
+        for (object in objects) {
+            if (present(target, object.key, object.value)) {
+                continue
+            }
+            copying |= !materialize(new File(cache, path(object.key)), new File(target, path(object.key)))
+            installed++
+        }
+        if (installed > 0) {
+            logger.lifecycle("Installed ${installed} asset objects into ${target}" +
+                    (copying ? ' (copied: the Gradle cache is on another volume)' : ' (hard links)'))
+        }
+    }
+
+    // returns true when hard-linked, false when copied
+    static boolean materialize(File source, File dest) {
+        dest.parentFile.mkdirs()
+        Files.deleteIfExists(dest.toPath())
+        try {
+            Files.createLink(dest.toPath(), source.toPath())
+            return true
+        } catch (IOException | UnsupportedOperationException ignored) {
+            Files.copy(source.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            return false
+        }
+    }
+
+    static Map<String, Long> uniqueObjects(File index) {
+        Map<String, Long> objects = new LinkedHashMap<>()
+        GameFiles.parse(index).objects.each { name, object ->
+            objects.put(String.valueOf(object.hash), ((Number) object.size).longValue())
+        }
+        return objects
+    }
+
+    static boolean present(File root, String hash, long size) {
+        File file = new File(root, path(hash))
+        return file.isFile() && file.length() == size
+    }
+
+    static String path(String hash) {
+        return "${hash.substring(0, 2)}/${hash}"
+    }
+}
+
+abstract class ProvisionGameNatives extends DefaultTask {
+
+    @InputFile abstract RegularFileProperty getVersionJson()
+
+    @Input abstract Property<String> getTargetOs()
+
+    @Input abstract Property<String> getTargetArch()
+
+    @OutputFile abstract RegularFileProperty getStamp()
+
+    @Internal abstract DirectoryProperty getNativesDir()
+
+    @Internal abstract DirectoryProperty getCacheDir()
+
+    @Internal abstract Property<Boolean> getOfflineMode()
+
+    @Internal abstract Property<String> getLocalInstall()
+
+    boolean checkInstalled() {
+        File file = stamp.get().asFile
+        if (!file.isFile()) {
+            return false
+        }
+        File natives = nativesDir.get().asFile
+        return file.readLines().every { line ->
+            int tab = line.lastIndexOf('\t')
+            if (tab < 0) {
+                return true
+            }
+            File extracted = new File(natives, line.substring(0, tab))
+            return extracted.isFile() && extracted.length() == Long.parseLong(line.substring(tab + 1))
+        }
+    }
+
+    @TaskAction
+    void install() {
+        String os = targetOs.get()
+        List<Map> artifacts = select(GameFiles.parse(versionJson.get().asFile), os, targetArch.get())
+        if (artifacts.isEmpty()) {
+            throw new GradleException(
+                    "The Minecraft version metadata lists no natives for os=${os}, so run/natives cannot be built.\n" +
+                    "1.8.9 ships natives for windows, osx and linux only.")
+        }
+
+        File cache = cacheDir.get().asFile
+        File natives = nativesDir.get().asFile
+        String local = GameFiles.checkedLocalDir(localInstall)
+        natives.mkdirs()
+
+        List<String> manifest = []
+        int written = 0
+        for (Map artifact : artifacts) {
+            File jar = new File(cache, String.valueOf(artifact.path))
+            if (!jar.isFile() || GameFiles.sha1(jar) != artifact.sha1) {
+                File supplied = GameFiles.localFile(local, "libraries/${artifact.path}")
+                if (supplied != null && GameFiles.sha1(supplied) == artifact.sha1) {
+                    GameFiles.copy(supplied, jar)
+                } else if (offlineMode.get()) {
+                    throw new GradleException(GameFiles.missingOffline(
+                            "the natives of ${artifact.name}", jar))
+                } else {
+                    logger.lifecycle("Downloading ${artifact.name} natives (${GameFiles.megabytes(artifact.size)})")
+                    GameFiles.download(String.valueOf(artifact.url), jar, String.valueOf(artifact.sha1))
+                }
+            }
+            written += extract(jar, natives, (List<String>) artifact.exclude, manifest)
+        }
+
+        if (written > 0) {
+            logger.lifecycle("Extracted ${written} native libraries into ${natives}")
+        }
+        File file = stamp.get().asFile
+        file.parentFile.mkdirs()
+        file.text = "natives ${os}-${targetArch.get()}\n" + manifest.join('\n') + '\n'
+    }
+
+    static int extract(File jar, File target, List<String> exclude, List<String> manifest) {
+        int written = 0
+        new ZipFile(jar).withCloseable { archive ->
+            for (entry in archive.entries()) {
+                String name = entry.name
+                if (entry.directory || exclude.any { name.startsWith(it) }) {
+                    continue
+                }
+                File dest = new File(target, name)
+                if (!dest.canonicalPath.startsWith(target.canonicalPath + File.separator)) {
+                    throw new GradleException("${jar.name} contains an entry outside the archive root: ${name}")
+                }
+                manifest << "${name}\t${entry.size}"
+                if (dest.isFile() && dest.length() == entry.size) {
+                    continue
+                }
+                dest.parentFile.mkdirs()
+                archive.getInputStream(entry).withStream { input ->
+                    dest.withOutputStream { output -> output << input }
+                }
+                written++
+            }
+        }
+        return written
+    }
+
+    static List<Map> select(Object metadata, String os, String arch) {
+        List<Map> artifacts = []
+        for (library in metadata.libraries) {
+            if (library.natives == null || !allowed(library.rules, os)) {
+                continue
+            }
+            String classifier = library.natives[os]
+            if (classifier == null) {
+                continue
+            }
+            def artifact = library.downloads?.classifiers?.get(classifier.replace('${arch}', arch))
+            if (artifact == null) {
+                continue
+            }
+            artifacts << [name   : String.valueOf(library.name),
+                          path   : String.valueOf(artifact.path),
+                          url    : String.valueOf(artifact.url),
+                          sha1   : String.valueOf(artifact.sha1).toLowerCase(),
+                          size   : ((Number) artifact.size).longValue(),
+                          exclude: (library.extract?.exclude ?: []) as List<String>]
+        }
+        return artifacts
+    }
+
+    // mojang rules: deny by default, last match wins
+    static boolean allowed(List rules, String os) {
+        if (rules == null || rules.isEmpty()) {
+            return true
+        }
+        boolean allow = false
+        for (rule in rules) {
+            if (rule.os?.name != null && rule.os.name != os) {
+                continue
+            }
+            if (rule.os?.version != null && !(System.getProperty('os.version') ==~ String.valueOf(rule.os.version))) {
+                continue
+            }
+            allow = rule.action == 'allow'
+        }
+        return allow
+    }
+}

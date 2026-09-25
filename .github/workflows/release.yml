@@ -1,0 +1,36 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag
+        required: true
+        default: v6.9.5
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - run: ./gradlew launcherVersion --no-daemon
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Rise ${{ inputs.tag }}
+          body: put it in versions\Rise then start it up
+          files: |
+            build/launcher/Rise/Rise.jar
+            build/launcher/Rise/Rise.json

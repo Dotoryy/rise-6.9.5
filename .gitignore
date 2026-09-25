@@ -1,0 +1,47 @@
+# local game dir
+run/
+
+# third-party assets, fetched at build time
+src/main/resources/assets/minecraft/blockstates/
+src/main/resources/assets/minecraft/models/
+src/main/resources/assets/minecraft/textures/
+src/main/resources/assets/minecraft/lang/
+src/main/resources/assets/minecraft/shaders/
+src/main/resources/assets/minecraft/optifine/
+src/main/resources/assets/minecraft/mcpatcher/
+src/main/resources/assets/minecraft/font/
+src/main/resources/assets/minecraft/texts/
+src/main/resources/assets/minecraft/title/
+
+client.jar
+client-open.jar
+client-final.jar
+client-src.jar
+/ViaMCP/
+src/main/resources/native/
+
+# pre-images of hand-patched libs/ jars: .pre-fix, .pre-enum, .pre-strip, ...
+libs/*.pre-*
+libs/*.stale
+libs/lombok-*.jar
+
+# build output
+build/
+out/
+.gradle/
+*.class
+bin/
+
+.idea/
+.vscode/
+*.iml
+
+COMPILE_STATUS.tsv
+protection_removed.tsv
+tools/
+*.log
+*.tsv.bak
+
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,36 @@
+package com.alan.clients.module.impl.movement.noslow;
+
+import com.alan.clients.module.impl.movement.NoSlow;
+import com.alan.clients.newevent.Listener;
+import com.alan.clients.newevent.annotations.EventLink;
+import com.alan.clients.newevent.impl.motion.SlowDownEvent;
+import com.alan.clients.value.Mode;
+import net.minecraft.item.ItemBow;
+import net.minecraft.item.ItemFood;
+import net.minecraft.item.ItemPotion;
+import net.minecraft.item.ItemSword;
+
+public class VanillaNoSlow extends Mode<NoSlow> {
+    @EventLink
+    public final Listener<SlowDownEvent> onSlowDown = var1x -> {
+        if (this.getParent().food.wo() && aEg.thePlayer.isUsingItem() && aEg.thePlayer.getHeldItem().getItem() instanceof ItemFood) {
+            var1x.setCancelled();
+        }
+
+        if (this.getParent().potion.wo() && aEg.thePlayer.isUsingItem() && aEg.thePlayer.getHeldItem().getItem() instanceof ItemPotion) {
+            var1x.setCancelled();
+        }
+
+        if (this.getParent().sword.wo() && aEg.thePlayer.isUsingItem() && aEg.thePlayer.getHeldItem().getItem() instanceof ItemSword) {
+            var1x.setCancelled();
+        }
+
+        if (this.getParent().bow.wo() && aEg.thePlayer.isUsingItem() && aEg.thePlayer.getHeldItem().getItem() instanceof ItemBow) {
+            var1x.setCancelled();
+        }
+    };
+
+    public VanillaNoSlow(String var1, NoSlow noSlow) {
+        super(var1, noSlow);
+    }
+}

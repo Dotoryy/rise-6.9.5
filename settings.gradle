@@ -1,0 +1,2 @@
+// idea module name; .run/*.run.xml refers to it
+rootProject.name = 'rise-open-source-ideaready'

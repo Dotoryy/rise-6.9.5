@@ -1,0 +1,416 @@
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+// Java's conditional-operator typing is not the JVM's, and a decompiler works in Java.
+//
+//     pruned/hackclient/rise/tn.ko()Z          the client Rise shipped
+//         47: iconst_1 / 48: goto 7            true
+//         51: bipush -63 / 53: goto 3          false: -63, +63 = 0, ireturn
+//
+// `ireturn 0` from a Z method IS `false`; the obfuscator's opaque zero is harmless in
+// bytecode. Written back out as Java it became
+//
+//     return (boolean)(cond ? true : -63 + 63);
+//
+// and JLS 15.25 has no primitive result type for `boolean` against `int`: the result is
+// lub(Boolean, Integer), BOTH arms box, and the cast unboxes. The false path throws
+// ClassCastException. That compiles, and equiv_gate cannot see it -- it compares our
+// output against our output, so a transcription that has always been wrong reads as
+// unchanged. The `work` gate is the one that does compare against the original jar, and
+// it filters `Boolean.valueOf` and `booleanValue` as autoboxing plumbing (calldiff2.py
+// BOX/UNBOX), which is exactly the evidence. Four instances reached the owner through
+// every gate here and threw on the render thread.
+//
+// So look at what javac emitted, not at the source. Whatever spelling the opaque
+// constant arrives in -- arithmetic, hex, XOR, a char literal, a method call -- a
+// conditional that mixes boolean with a number leaves the same fingerprint: a stack
+// merge whose two arms box DIFFERENT types. Nothing legitimate in this tree does that.
+
+def mixedBoxMerge = tasks.register('mixedBoxMerge', MixedBoxMergeCheck) {
+    group = 'verification'
+    description = 'Fail the build on a conditional whose arms box two different types.'
+    report = layout.buildDirectory.file('reports/mixed-box-merge.txt')
+}
+
+plugins.withId('java') {
+    mixedBoxMerge.configure { classes.from(sourceSets.main.output.classesDirs) }
+    tasks.named('check') { dependsOn mixedBoxMerge }
+}
+
+@groovy.transform.CompileStatic
+abstract class MixedBoxMergeCheck extends DefaultTask {
+
+    private static final Map<String, String> BOX = [
+            'java/lang/Boolean'  : 'Boolean', 'java/lang/Character': 'Character',
+            'java/lang/Byte'     : 'Byte', 'java/lang/Short': 'Short',
+            'java/lang/Integer'  : 'Integer', 'java/lang/Long': 'Long',
+            'java/lang/Float'    : 'Float', 'java/lang/Double': 'Double']
+
+    // goto / goto_w / the return family / athrow / ret / both switches. An instruction
+    // after one of these is not reached by falling through it.
+    private static final Set<Integer> NO_FALLTHROUGH =
+            [167, 200, 172, 173, 174, 175, 176, 177, 191, 169, 170, 171] as Set
+
+    @InputFiles
+    @PathSensitive(PathSensitivity.RELATIVE)
+    abstract ConfigurableFileCollection getClasses()
+
+    @OutputFile
+    abstract RegularFileProperty getReport()
+
+    @TaskAction
+    void verify() {
+        List<String> problems = new ArrayList<String>()
+        int scanned = 0
+        List<File> roots = new ArrayList<File>(classes.files)
+        Collections.sort(roots)
+        for (File root : roots) {
+            if (!root.exists()) {
+                continue
+            }
+            List<File> files = new ArrayList<File>()
+            root.eachFileRecurse { File f -> if (f.name.endsWith('.class')) files.add(f) }
+            Collections.sort(files)
+            for (File f : files) {
+                scanned++
+                problems.addAll(scanClass(f.bytes))
+            }
+        }
+        File out = report.get().asFile
+        out.parentFile.mkdirs()
+        if (problems.isEmpty()) {
+            out.setText('ok: ' + scanned + ' class files, no mixed box merge\n', 'UTF-8')
+            return
+        }
+        String message = (problems.size() == 1
+                ? 'A conditional in this tree boxes a different type on each arm:'
+                : problems.size() + ' conditionals in this tree box a different type on each arm:') +
+                '\n\n' + problems.join('\n\n') + '\n\n' +
+                'Java gave that expression the type lub(A, B); the bytecode this was\n' +
+                'transcribed from had ONE primitive type and no box at all. Read the method\n' +
+                'in pruned/ -- an `ireturn` of an opaque zero from a Z method is `false`, and\n' +
+                'the whole conditional is the condition. Reproducing the arithmetic in Java\n' +
+                'does not reproduce the bytecode, it just moves the failure to runtime.'
+        out.setText(message + '\n', 'UTF-8')
+        throw new GradleException(message)
+    }
+
+    /**
+     * The producers of the value live at a merge point are the instruction textually
+     * before it (unless that one cannot fall through) and the instruction before every
+     * `goto` that targets it. A conditional branch is deliberately NOT read as a
+     * producer: it consumes its operands, so the value arriving down that edge was
+     * pushed earlier and this local view cannot see where. No evidence, no claim.
+     */
+    private static List<String> scanClass(byte[] d) {
+        List<String> out = new ArrayList<String>()
+        ClassFile cf
+        try {
+            cf = new ClassFile(d)
+        } catch (Exception ignored) {
+            return out          // a class we cannot read is not evidence of anything
+        }
+        for (MethodInfo m : cf.methods) {
+            List<Ins> ins = decode(m.code, cf)
+            Map<Integer, Integer> pc2i = new HashMap<Integer, Integer>()
+            for (int k = 0; k < ins.size(); k++) {
+                pc2i.put(Integer.valueOf(ins[k].pc), Integer.valueOf(k))
+            }
+            Map<Integer, List<Integer>> jumps = new HashMap<Integer, List<Integer>>()
+            for (int k = 0; k < ins.size(); k++) {
+                for (Integer t : ins[k].targets) {
+                    List<Integer> l = jumps.get(t)
+                    if (l == null) {
+                        jumps.put(t, l = new ArrayList<Integer>())
+                    }
+                    l.add(Integer.valueOf(k))
+                }
+            }
+            for (int k = 0; k < ins.size(); k++) {
+                List<Integer> prod = new ArrayList<Integer>()
+                if (k > 0 && !NO_FALLTHROUGH.contains(Integer.valueOf(ins[k - 1].op))) {
+                    prod.add(Integer.valueOf(k - 1))
+                }
+                for (Integer j : (jumps.get(Integer.valueOf(ins[k].pc)) ?: new ArrayList<Integer>())) {
+                    int ji = j.intValue()
+                    if (ji > 0 && (ins[ji].op == 167 || ins[ji].op == 200)) {
+                        prod.add(Integer.valueOf(ji - 1))
+                    }
+                }
+                Map<String, Integer> kinds = new LinkedHashMap<String, Integer>()
+                for (Integer p : prod) {
+                    String b = ins[p.intValue()].boxed
+                    if (b != null) {
+                        kinds.put(b, p)
+                    }
+                }
+                if (kinds.size() >= 2) {
+                    StringBuilder sb = new StringBuilder()
+                    sb.append(cf.thisName.replace('/', '.'))
+                    if (cf.source != null) {
+                        sb.append('  (').append(cf.source)
+                        Integer line = m.lineOf(ins[k].pc)
+                        if (line != null) {
+                            sb.append(':').append(line)
+                        }
+                        sb.append(')')
+                    }
+                    sb.append('\n  method ').append(m.name).append(m.desc)
+                    sb.append('\n  merge at pc ').append(ins[k].pc)
+                    sb.append(' of ').append(kinds.keySet().join(' + '))
+                    for (Integer p : new TreeSet<Integer>(prod)) {
+                        sb.append('\n    arm  @').append(ins[p.intValue()].pc)
+                                .append('  ').append(ins[p.intValue()].text)
+                    }
+                    for (int q = k; q < Math.min(k + 3, ins.size()); q++) {
+                        sb.append('\n    use  @').append(ins[q].pc).append('  ').append(ins[q].text)
+                    }
+                    out.add(sb.toString())
+                }
+            }
+        }
+        return out
+    }
+
+    // ------------------------------------------------------------- instructions
+
+    @groovy.transform.CompileStatic
+    private static class Ins {
+        int pc
+        int op
+        String text
+        String boxed                       // the box class this instruction produces
+        List<Integer> targets = new ArrayList<Integer>()
+    }
+
+    private static List<Ins> decode(byte[] code, ClassFile cf) {
+        List<Ins> out = new ArrayList<Ins>()
+        ByteBuffer b = ByteBuffer.wrap(code).order(ByteOrder.BIG_ENDIAN)
+        int n = code.length
+        while (b.position() < n) {
+            int pc = b.position()
+            int op = b.get() & 0xFF
+            Ins i = new Ins(pc: pc, op: op, text: String.valueOf(op))
+            if (op >= 153 && op <= 168 || op == 198 || op == 199) {
+                i.targets.add(Integer.valueOf(pc + (int) b.getShort()))
+            } else if (op == 200 || op == 201) {
+                i.targets.add(Integer.valueOf(pc + b.getInt()))
+            } else if (op == 170) {                       // tableswitch
+                pad(b, pc)
+                int dflt = b.getInt(), lo = b.getInt(), hi = b.getInt()
+                i.targets.add(Integer.valueOf(pc + dflt))
+                for (int k = 0; k <= hi - lo; k++) {
+                    i.targets.add(Integer.valueOf(pc + b.getInt()))
+                }
+            } else if (op == 171) {                       // lookupswitch
+                pad(b, pc)
+                int dflt = b.getInt(), np = b.getInt()
+                i.targets.add(Integer.valueOf(pc + dflt))
+                for (int k = 0; k < np; k++) {
+                    b.getInt()
+                    i.targets.add(Integer.valueOf(pc + b.getInt()))
+                }
+            } else if (op == 184 || op == 182 || op == 183) {
+                int ci = b.getShort() & 0xFFFF
+                String[] r = cf.ref(ci)
+                i.text = 'invoke ' + r[0] + '.' + r[1] + ':' + r[2]
+                if (op == 184 && r[1] == 'valueOf' && BOX.containsKey(r[0])) {
+                    i.boxed = BOX.get(r[0])
+                }
+            } else if (op == 185 || op == 186) {
+                b.getShort(); b.getShort()
+            } else if (op == 187 || op == 189 || op == 192 || op == 193) {
+                int ci = b.getShort() & 0xFFFF
+                i.text = op + ' ' + cf.className(ci)
+            } else if (op == 16 || op == 18 || op == 21 || op == 22 || op == 23 || op == 24 ||
+                    op == 25 || op == 54 || op == 55 || op == 56 || op == 57 || op == 58 ||
+                    op == 169 || op == 188) {
+                int v = b.get() & 0xFF
+                i.text = op + ' ' + v
+            } else if (op == 17 || op == 19 || op == 20 || op == 132 || op == 178 || op == 179 ||
+                    op == 180 || op == 181) {
+                i.text = op + ' ' + (b.getShort() & 0xFFFF)
+            } else if (op == 197) {
+                b.getShort(); b.get()
+            } else if (op == 196) {                       // wide
+                int op2 = b.get() & 0xFF
+                b.getShort()
+                if (op2 == 132) {
+                    b.getShort()
+                }
+            }
+            if (i.text == String.valueOf(op)) {
+                i.text = 'op ' + op
+            }
+            out.add(i)
+        }
+        return out
+    }
+
+    private static void pad(ByteBuffer b, int pc) {
+        int skip = (4 - ((pc + 1) % 4)) % 4
+        b.position(b.position() + skip)
+    }
+
+    // -------------------------------------------------------------- class file
+
+    @groovy.transform.CompileStatic
+    private static class MethodInfo {
+        String name
+        String desc
+        byte[] code
+        int[] lineStart = new int[0]
+        int[] lineNo = new int[0]
+
+        /** the line whose range covers pc: the largest start_pc not past it */
+        Integer lineOf(int pc) {
+            int bestStart = -1
+            Integer best = null
+            for (int k = 0; k < lineStart.length; k++) {
+                if (lineStart[k] <= pc && lineStart[k] > bestStart) {
+                    bestStart = lineStart[k]
+                    best = Integer.valueOf(lineNo[k])
+                }
+            }
+            return best
+        }
+    }
+
+    /**
+     * Hand-rolled, like stale-literals.gradle's pool reader and for the same reason: the
+     * build has no ASM dependency and this needs four things out of a class file. The
+     * long/double two-slot rule is the only subtlety, and getting it wrong silently
+     * shifts every later constant pool index.
+     */
+    @groovy.transform.CompileStatic
+    private static class ClassFile {
+        String thisName
+        String source
+        List<MethodInfo> methods = new ArrayList<MethodInfo>()
+        private Map<Integer, String> utf = new HashMap<Integer, String>()
+        private Map<Integer, int[]> refs = new HashMap<Integer, int[]>()
+        private Map<Integer, Integer> classes = new HashMap<Integer, Integer>()
+
+        ClassFile(byte[] d) {
+            ByteBuffer b = ByteBuffer.wrap(d).order(ByteOrder.BIG_ENDIAN)
+            b.position(8)
+            int n = b.getShort() & 0xFFFF
+            int i = 1
+            while (i < n) {
+                int tag = b.get() & 0xFF
+                switch (tag) {
+                    case 1:
+                        int len = b.getShort() & 0xFFFF
+                        byte[] raw = new byte[len]
+                        b.get(raw)
+                        utf.put(Integer.valueOf(i), new String(raw, 'UTF-8'))
+                        break
+                    case 7:
+                        classes.put(Integer.valueOf(i), Integer.valueOf(b.getShort() & 0xFFFF))
+                        break
+                    case 8: case 16: case 19: case 20:
+                        b.position(b.position() + 2)
+                        break
+                    case 15:
+                        b.position(b.position() + 3)
+                        break
+                    case 9: case 10: case 11: case 12:
+                        refs.put(Integer.valueOf(i),
+                                [b.getShort() & 0xFFFF, b.getShort() & 0xFFFF] as int[])
+                        break
+                    case 3: case 4: case 17: case 18:
+                        b.position(b.position() + 4)
+                        break
+                    case 5: case 6:
+                        b.position(b.position() + 8)
+                        i++                    // long and double take two pool slots
+                        break
+                    default:
+                        throw new IllegalStateException('constant pool tag ' + tag)
+                }
+                i++
+            }
+            b.getShort()
+            thisName = className(b.getShort() & 0xFFFF)
+            b.getShort()
+            int ni = b.getShort() & 0xFFFF
+            b.position(b.position() + 2 * ni)
+            for (int kind = 0; kind < 2; kind++) {
+                int cnt = b.getShort() & 0xFFFF
+                for (int k = 0; k < cnt; k++) {
+                    b.getShort()
+                    String nm = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                    String ds = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                    int na = b.getShort() & 0xFFFF
+                    MethodInfo mi = new MethodInfo(name: nm, desc: ds)
+                    for (int a = 0; a < na; a++) {
+                        String an = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                        int al = b.getInt()
+                        int end = b.position() + al
+                        if (kind == 1 && 'Code' == an) {
+                            readCode(b, mi)
+                        }
+                        b.position(end)
+                    }
+                    if (kind == 1 && mi.code != null) {
+                        methods.add(mi)
+                    }
+                }
+            }
+            int na = b.getShort() & 0xFFFF
+            for (int a = 0; a < na; a++) {
+                String an = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                int al = b.getInt()
+                int end = b.position() + al
+                if ('SourceFile' == an) {
+                    source = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                }
+                b.position(end)
+            }
+        }
+
+        private void readCode(ByteBuffer b, MethodInfo mi) {
+            b.getShort(); b.getShort()
+            int cl = b.getInt()
+            byte[] code = new byte[cl]
+            b.get(code)
+            mi.code = code
+            int en = b.getShort() & 0xFFFF
+            b.position(b.position() + 8 * en)
+            int can = b.getShort() & 0xFFFF
+            for (int a = 0; a < can; a++) {
+                String an = utf.get(Integer.valueOf(b.getShort() & 0xFFFF))
+                int al = b.getInt()
+                int end = b.position() + al
+                if ('LineNumberTable' == an) {
+                    int ln = b.getShort() & 0xFFFF
+                    int[] st = new int[ln]
+                    int[] no = new int[ln]
+                    for (int k = 0; k < ln; k++) {
+                        st[k] = b.getShort() & 0xFFFF
+                        no[k] = b.getShort() & 0xFFFF
+                    }
+                    mi.lineStart = st
+                    mi.lineNo = no
+                }
+                b.position(end)
+            }
+        }
+
+        String className(int ci) {
+            Integer ni = classes.get(Integer.valueOf(ci))
+            return ni == null ? '?' : (utf.get(ni) ?: '?')
+        }
+
+        String[] ref(int ci) {
+            int[] r = refs.get(Integer.valueOf(ci))
+            if (r == null) {
+                return ['?', '?', '?'] as String[]
+            }
+            int[] nt = refs.get(Integer.valueOf(r[1]))
+            String nm = nt == null ? '?' : (utf.get(Integer.valueOf(nt[0])) ?: '?')
+            String ds = nt == null ? '?' : (utf.get(Integer.valueOf(nt[1])) ?: '?')
+            return [className(r[0]), nm, ds] as String[]
+        }
+    }
+}
